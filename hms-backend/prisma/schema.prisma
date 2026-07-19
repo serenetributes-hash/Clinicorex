@@ -1,0 +1,450 @@
+// Clinicore HMS — core database schema
+// Run: npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------- Enums ----------------
+
+enum Role {
+  ADMIN
+  RECEPTIONIST
+  NURSE
+  DOCTOR
+  LAB_TECH
+  PHARMACIST
+  CASHIER
+  WARD_NURSE
+  THEATRE_NURSE
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum EncounterType {
+  OUTPATIENT
+  INPATIENT
+  EMERGENCY
+}
+
+enum EncounterStatus {
+  REGISTERED
+  TRIAGE
+  CONSULTATION
+  LABORATORY
+  PHARMACY
+  CASHIER
+  AWAITING_ADMISSION
+  AWAITING_THEATRE
+  ADMITTED
+  DISCHARGED
+  CANCELLED
+}
+
+// One row per department a patient passes through. This is the shared
+// work queue that multiple staff in the same department pull from.
+enum Department {
+  TRIAGE
+  CONSULTATION
+  LABORATORY
+  PHARMACY
+  CASHIER
+  THEATRE
+  WARD
+}
+
+enum QueueStatus {
+  WAITING     // sitting in the shared queue, unclaimed
+  CLAIMED     // a staff member has picked this patient
+  COMPLETED   // that department's work is done, patient has moved on
+  CANCELLED
+}
+
+enum Priority {
+  NORMAL
+  URGENT
+  EMERGENCY
+}
+
+enum PaymentMethod {
+  CASH
+  INSURANCE
+}
+
+enum ClaimStatus {
+  SUBMITTED
+  APPROVED
+  PAID
+  REJECTED
+}
+
+enum BedStatus {
+  AVAILABLE
+  OCCUPIED
+  MAINTENANCE
+}
+
+enum LabOrderStatus {
+  PENDING
+  COMPLETED
+}
+
+// ---------------- Core identity ----------------
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  claimedQueueEntries QueueEntry[] @relation("ClaimedBy")
+  auditLogs           AuditLog[]
+
+  @@index([role])
+}
+
+model Patient {
+  id               String   @id @default(cuid())
+  mrn              String   @unique
+  firstName        String
+  lastName         String
+  dob              DateTime?
+  gender           Gender
+  phone            String?
+  nationalId       String?
+  address          String?
+  nextOfKinName    String?
+  nextOfKinPhone   String?
+  insuranceProvider String?
+  insuranceNo      String?
+  createdAt        DateTime @default(now())
+
+  encounters Encounter[]
+
+  @@index([lastName, firstName])
+  @@index([phone])
+}
+
+// One row per visit. This is what actually moves through departments.
+model Encounter {
+  id              String           @id @default(cuid())
+  patient         Patient          @relation(fields: [patientId], references: [id])
+  patientId       String
+  type            EncounterType    @default(OUTPATIENT)
+  status          EncounterStatus  @default(REGISTERED)
+  chiefComplaint  String?
+  registeredById  String?
+  registeredAt    DateTime         @default(now())
+  dischargedAt    DateTime?
+
+  triage         TriageRecord?
+  consultations  Consultation[]
+  labOrders      LabOrder[]
+  prescriptions  Prescription[]
+  billingItems   BillingItem[]
+  payment        Payment?
+  queueEntries   QueueEntry[]
+  admission      Admission?
+  bookings       Booking[]
+
+  @@index([status])
+  @@index([patientId])
+}
+
+// ---------------- Queue system (shared across all departments) ----------------
+
+model QueueEntry {
+  id          String      @id @default(cuid())
+  encounter   Encounter   @relation(fields: [encounterId], references: [id])
+  encounterId String
+  department  Department
+  status      QueueStatus @default(WAITING)
+  priority    Priority    @default(NORMAL)
+
+  claimedBy   User?     @relation("ClaimedBy", fields: [claimedById], references: [id])
+  claimedById String?
+  claimedAt   DateTime?
+  completedAt DateTime?
+
+  createdAt   DateTime  @default(now())
+
+  @@index([department, status])
+  @@index([encounterId, department])
+}
+
+// ---------------- Clinical ----------------
+
+model TriageRecord {
+  id          String    @id @default(cuid())
+  encounter   Encounter @relation(fields: [encounterId], references: [id])
+  encounterId String    @unique
+  bp          String?
+  temp        Float?
+  pulse       Int?
+  spo2        Int?
+  weight      Float?
+  priority    Priority  @default(NORMAL)
+  notes       String?
+  recordedById String?
+  recordedAt  DateTime  @default(now())
+}
+
+model Consultation {
+  id          String    @id @default(cuid())
+  encounter   Encounter @relation(fields: [encounterId], references: [id])
+  encounterId String
+  doctorId    String?
+  diagnosis   String?
+  notes       String?
+  createdAt   DateTime  @default(now())
+}
+
+model LabOrder {
+  id          String         @id @default(cuid())
+  encounter   Encounter      @relation(fields: [encounterId], references: [id])
+  encounterId String
+  testName    String
+  price       Decimal        @db.Decimal(10, 2)
+  status      LabOrderStatus @default(PENDING)
+  result      String?
+  orderedById String?
+  resultedById String?
+  orderedAt   DateTime       @default(now())
+  resultedAt  DateTime?
+}
+
+// The lab test menu doctors order from — editable by an admin (Pricing
+// page) instead of being fixed in code. "active: false" retires a test
+// without deleting history — old LabOrders keep their own testName/price
+// snapshot regardless, so retiring one never rewrites past bills.
+model LabTest {
+  id     String  @id @default(cuid())
+  name   String  @unique
+  price  Decimal @db.Decimal(10, 2)
+  active Boolean @default(true)
+}
+
+// A catalog of miscellaneous named charges (e.g. "Medical report fee",
+// "Ambulance fee", "Dressing fee") for things that don't fit consultation,
+// lab, pharmacy, theatre, or ward billing — added to a bill from Cashier.
+// Same "active" retirement pattern as LabTest.
+model OtherFee {
+  id     String  @id @default(cuid())
+  name   String  @unique
+  price  Decimal @db.Decimal(10, 2)
+  active Boolean @default(true)
+}
+
+// ---------------- Pharmacy & stock ----------------
+
+model InventoryItem {
+  id           String    @id @default(cuid())
+  name         String
+  category     String    // Medicine | Consumable | Equipment
+  unit         String
+  quantity     Int       @default(0)
+  reorderLevel Int       @default(0)
+  unitPrice    Decimal   @db.Decimal(10, 2)
+  expiryDate   DateTime?
+  batchNo      String?
+  createdAt    DateTime  @default(now())
+
+  prescriptions Prescription[]
+  transactions  InventoryTransaction[]
+
+  @@index([category])
+}
+
+// Every stock movement (dispense, restock, adjustment) is logged here —
+// this is the audit trail finance/pharmacy will need.
+model InventoryTransaction {
+  id            String        @id @default(cuid())
+  item          InventoryItem @relation(fields: [itemId], references: [id])
+  itemId        String
+  changeQty     Int           // negative for dispense/loss, positive for restock
+  reason        String        // e.g. "Dispensed", "Restock", "Expired/wastage"
+  referenceType String?       // e.g. "Prescription"
+  referenceId   String?
+  createdById   String?
+  createdAt     DateTime      @default(now())
+}
+
+model Prescription {
+  id           String        @id @default(cuid())
+  encounter    Encounter     @relation(fields: [encounterId], references: [id])
+  encounterId  String
+  item         InventoryItem @relation(fields: [itemId], references: [id])
+  itemId       String
+  quantity     Int
+  dispensed    Boolean       @default(false)
+  dispensedAt  DateTime?
+  dispensedById String?
+}
+
+// ---------------- Theatre / equipment (itemized billing) ----------------
+
+model Equipment {
+  id       String              @id @default(cuid())
+  name     String
+  type     String              // Theatre | Radiology | Diagnostic
+  feeItems EquipmentFeeItem[]
+  bookings Booking[]
+}
+
+model EquipmentFeeItem {
+  id            String    @id @default(cuid())
+  equipment     Equipment @relation(fields: [equipmentId], references: [id])
+  equipmentId   String
+  label         String    // e.g. "Surgeon's fee", "Anaesthesia fee"
+  defaultAmount Decimal   @db.Decimal(10, 2)
+}
+
+model Booking {
+  id          String    @id @default(cuid())
+  equipment   Equipment @relation(fields: [equipmentId], references: [id])
+  equipmentId String
+  encounter   Encounter? @relation(fields: [encounterId], references: [id])
+  encounterId String?
+  date        DateTime
+  time        String
+  durationMin Int
+  purpose     String?
+  status      String    @default("Scheduled") // Scheduled | In progress | Completed | Cancelled
+  createdById String?
+  createdAt   DateTime  @default(now())
+
+  charges BookingCharge[]
+}
+
+// The itemized breakdown actually charged for a booking (copied from the
+// equipment's default fee items at booking time, editable per case).
+model BookingCharge {
+  id        String  @id @default(cuid())
+  booking   Booking @relation(fields: [bookingId], references: [id])
+  bookingId String
+  label     String
+  amount    Decimal @db.Decimal(10, 2)
+}
+
+// ---------------- Billing & finance ----------------
+
+model BillingItem {
+  id          String    @id @default(cuid())
+  encounter   Encounter @relation(fields: [encounterId], references: [id])
+  encounterId String
+  description String
+  amount      Decimal   @db.Decimal(10, 2)
+  category    String?   // Consultation | Laboratory | Pharmacy | Theatre/Imaging
+  createdAt   DateTime  @default(now())
+}
+
+model Payment {
+  id                String       @id @default(cuid())
+  encounter         Encounter    @relation(fields: [encounterId], references: [id])
+  encounterId       String       @unique
+  method            PaymentMethod
+  amount            Decimal      @db.Decimal(10, 2)
+  insuranceProvider String?
+  claimNo           String?
+  claimStatus       ClaimStatus?
+  claimSubmittedAt  DateTime?
+  paidAt            DateTime?
+  recordedById      String?
+}
+
+model Expense {
+  id          String   @id @default(cuid())
+  date        DateTime
+  category    String
+  amount      Decimal  @db.Decimal(10, 2)
+  vendor      String?
+  notes       String?
+  recordedById String?
+  createdAt   DateTime @default(now())
+}
+
+// ---------------- Inpatient / wards ----------------
+
+model Ward {
+  id             String  @id @default(cuid())
+  name           String
+  type           String? // e.g. "General", "Maternity", "ICU", "Pediatric"
+  dailyRate      Decimal @default(0) @db.Decimal(10, 2) // bed/board, charged per day of stay, in KES
+  doctorRoundFee Decimal @default(0) @db.Decimal(10, 2) // standard daily rate for a doctor's routine ward round, in KES — separate from dailyRate and from the outpatient consultation fee
+  beds           Bed[]
+}
+
+model Bed {
+  id       String    @id @default(cuid())
+  ward     Ward      @relation(fields: [wardId], references: [id])
+  wardId   String
+  bedNumber String
+  status   BedStatus @default(AVAILABLE)
+
+  admissions Admission[]
+
+  @@unique([wardId, bedNumber])
+}
+
+model Admission {
+  id                 String    @id @default(cuid())
+  encounter          Encounter @relation(fields: [encounterId], references: [id])
+  encounterId        String    @unique
+  bed                Bed       @relation(fields: [bedId], references: [id])
+  bedId              String
+  admittedAt         DateTime  @default(now())
+  admittedById       String?
+  expectedDischarge  DateTime?
+  dischargedAt       DateTime?
+  admittingDiagnosis String?
+
+  nursingNotes NursingNote[]
+}
+
+model NursingNote {
+  id           String    @id @default(cuid())
+  admission    Admission @relation(fields: [admissionId], references: [id])
+  admissionId  String
+  note         String
+  recordedById String?
+  recordedAt   DateTime  @default(now())
+}
+
+// ---------------- Audit ----------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  user       User?    @relation(fields: [userId], references: [id])
+  userId     String?
+  action     String   // e.g. "queue.claim", "payment.recorded"
+  entityType String   // e.g. "Encounter", "QueueEntry"
+  entityId   String?
+  details    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId])
+}
+
+// ---------------- Admin-editable pricing ----------------
+
+// Flat system-wide fees an admin can change from the Pricing page instead
+// of a code change + redeploy — e.g. "consultationFee", "emergencyWardVisitFee".
+// Everything else priced (lab tests, pharmacy items, ward rates, theatre/
+// equipment fees) already has its own table with a price field.
+model Setting {
+  key   String @id
+  value String
+}
