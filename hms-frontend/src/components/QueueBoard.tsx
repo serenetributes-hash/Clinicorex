@@ -9,7 +9,7 @@ interface QueueBoardProps {
   title: string;
   subtitle: string;
   /** Render the action form/details for the currently-selected claimed patient. */
-  renderAction: (entry: QueueEntry, onDone: () => void, refresh: () => void) => ReactNode;
+  renderAction: (entry: QueueEntry, onDone: () => void) => ReactNode;
   /** Poll interval in ms; defaults to 5s so multiple staff stay roughly in sync. */
   pollMs?: number;
 }
@@ -137,14 +137,10 @@ export function QueueBoard({ department, title, subtitle, renderAction, pollMs =
               <p className="text-sm">Pick a patient from the waiting list, or select one of your claimed patients.</p>
             </div>
           ) : (
-            renderAction(
-              selected,
-              () => {
-                setSelectedId(null);
-                load();
-              },
-              load
-            )
+            renderAction(selected, () => {
+              setSelectedId(null);
+              load();
+            })
           )}
         </Card>
       </div>

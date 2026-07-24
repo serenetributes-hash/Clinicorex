@@ -3,6 +3,7 @@ import { QueueBoard } from "../components/QueueBoard";
 import { api, ApiError } from "../api/client";
 import { QueueEntry } from "../types";
 import { ErrorBanner } from "../components/ui";
+import { NoteBox } from "../components/NoteBox";
 
 function LabForm({ entry, onDone }: { entry: QueueEntry; onDone: () => void }) {
   const p = entry.encounter.patient!;
@@ -48,6 +49,7 @@ function LabForm({ entry, onDone }: { entry: QueueEntry; onDone: () => void }) {
       <button disabled={submitting} className="mt-4 bg-teal-800 text-white rounded-lg py-2.5 px-5 text-sm font-medium hover:bg-teal-900 disabled:opacity-50">
         {submitting ? "Saving..." : "Submit results"}
       </button>
+      <NoteBox encounterId={entry.encounterId} existingNotes={entry.encounter.notes} />
     </form>
   );
 }

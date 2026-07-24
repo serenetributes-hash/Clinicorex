@@ -3,7 +3,7 @@ import { z } from "zod";
 import { prisma } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { requireRole } from "../middleware/roles";
-import { enqueue, dischargeAdmission } from "../utils/workflow";
+import { enqueue } from "../utils/workflow";
 import { logAction } from "../utils/audit";
 
 const router = Router();
@@ -11,66 +11,9 @@ const router = Router();
 /** GET /wards — occupancy overview */
 router.get("/", requireAuth, async (_req, res) => {
   const wards = await prisma.ward.findMany({
-    include: {
-      beds: {
-        include: {
-          admissions: {
-            where: { dischargedAt: null },
-            include: {
-              encounter: { include: { patient: true } },
-              nursingNotes: { orderBy: { recordedAt: "desc" } },
-            },
-          },
-        },
-      },
-    },
+    include: { beds: { include: { admissions: { where: { dischargedAt: null }, include: { encounter: { include: { patient: true } } } } } } },
   });
   res.json(wards);
-});
-
-const createWardSchema = z.object({
-  name: z.string().min(1),
-  type: z.string().optional(),
-  dailyRate: z.number().min(0),
-  doctorRoundFee: z.number().min(0),
-  bedCount: z.number().int().min(1).max(200),
-});
-
-/** POST /wards — admin only: add a new ward with its beds and rates */
-router.post("/", requireAuth, requireRole("ADMIN"), async (req: AuthedRequest, res) => {
-  const parsed = createWardSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-  const { bedCount, ...wardData } = parsed.data;
-
-  const ward = await prisma.$transaction(async (tx) => {
-    const w = await tx.ward.create({ data: wardData });
-    for (let i = 1; i <= bedCount; i++) {
-      await tx.bed.create({ data: { wardId: w.id, bedNumber: String(i).padStart(2, "0") } });
-    }
-    return w;
-  });
-
-  await logAction({ userId: req.user!.id, action: "ward.created", entityType: "Ward", entityId: ward.id });
-  res.status(201).json(ward);
-});
-
-const updateWardSchema = z.object({
-  name: z.string().min(1).optional(),
-  type: z.string().optional(),
-  dailyRate: z.number().min(0).optional(),
-  doctorRoundFee: z.number().min(0).optional(),
-});
-
-/** PATCH /wards/:id — admin only: change a ward's name/type/rates */
-router.patch("/:id", requireAuth, requireRole("ADMIN"), async (req: AuthedRequest, res) => {
-  const parsed = updateWardSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-
-  const ward = await prisma.ward.update({ where: { id: req.params.id }, data: parsed.data }).catch(() => null);
-  if (!ward) return res.status(404).json({ error: "Ward not found" });
-
-  await logAction({ userId: req.user!.id, action: "ward.updated", entityType: "Ward", entityId: ward.id, details: parsed.data });
-  res.json(ward);
 });
 
 const admitSchema = z.object({
@@ -147,85 +90,6 @@ router.post("/admissions/:id/notes", requireAuth, requireRole("DOCTOR", "WARD_NU
   res.status(201).json(note);
 });
 
-const callDoctorSchema = z.object({ emergency: z.boolean().default(false) });
-
-/**
- * POST /admissions/:id/call-doctor
- * Sends an admitted patient to the Consultation queue without discharging
- * them or freeing their bed — the doctor sees them via the ward-round
- * screen (POST /encounters/:id/ward-round) and the patient comes right
- * back to the same bed afterward unless referred elsewhere.
- *
- * "emergency: true" marks this as a genuine after-hours/emergency
- * call-out rather than a routine round — it's billed as a one-off
- * Emergency ward visit fee instead of being absorbed into the ward's
- * standard daily doctor-round rate (see dischargeAdmission).
- */
-router.post("/admissions/:id/call-doctor", requireAuth, requireRole("DOCTOR", "WARD_NURSE"), async (req: AuthedRequest, res) => {
-  const parsed = callDoctorSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Invalid request" });
-
-  const admission = await prisma.admission.findUnique({ where: { id: req.params.id } });
-  if (!admission) return res.status(404).json({ error: "Admission not found" });
-  if (admission.dischargedAt) return res.status(400).json({ error: "This admission has already been discharged" });
-
-  const alreadyWaiting = await prisma.queueEntry.findFirst({
-    where: { encounterId: admission.encounterId, department: "CONSULTATION", status: { in: ["WAITING", "CLAIMED"] } },
-  });
-  if (alreadyWaiting) return res.status(409).json({ error: "A doctor has already been called for this patient" });
-
-  await prisma.$transaction(async (tx) => {
-    await tx.encounter.update({ where: { id: admission.encounterId }, data: { status: "CONSULTATION" } });
-    await enqueue(tx, admission.encounterId, "CONSULTATION", parsed.data.emergency ? "EMERGENCY" : "NORMAL");
-  });
-
-  await logAction({
-    userId: req.user!.id,
-    action: "ward.called_doctor",
-    entityType: "Admission",
-    entityId: admission.id,
-    details: { emergency: parsed.data.emergency },
-  });
-  res.status(201).json({ ok: true });
-});
-
-const orderMedicineSchema = z.object({
-  prescriptions: z.array(z.object({ itemId: z.string(), quantity: z.number().int().min(1) })).min(1),
-});
-
-/**
- * POST /admissions/:id/order-medicine
- * Sends an admitted patient's medicine order straight to Pharmacy without
- * a full doctor consultation — for routine in-stay medication. The bed
- * stays reserved, and once dispensed the patient is routed straight back
- * to the ward (see the dispense logic in encounters.routes.ts), not to
- * the cashier.
- */
-router.post("/admissions/:id/order-medicine", requireAuth, requireRole("DOCTOR", "WARD_NURSE"), async (req: AuthedRequest, res) => {
-  const parsed = orderMedicineSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Add at least one medicine" });
-
-  const admission = await prisma.admission.findUnique({ where: { id: req.params.id } });
-  if (!admission) return res.status(404).json({ error: "Admission not found" });
-  if (admission.dischargedAt) return res.status(400).json({ error: "This admission has already been discharged" });
-
-  const items = await prisma.inventoryItem.findMany({ where: { id: { in: parsed.data.prescriptions.map((p) => p.itemId) } } });
-  if (items.length !== parsed.data.prescriptions.length) {
-    return res.status(400).json({ error: "One or more selected items don't exist in inventory" });
-  }
-
-  await prisma.$transaction(async (tx) => {
-    for (const rx of parsed.data.prescriptions) {
-      await tx.prescription.create({ data: { encounterId: admission.encounterId, itemId: rx.itemId, quantity: rx.quantity } });
-    }
-    await tx.encounter.update({ where: { id: admission.encounterId }, data: { status: "PHARMACY" } });
-    await enqueue(tx, admission.encounterId, "PHARMACY");
-  });
-
-  await logAction({ userId: req.user!.id, action: "ward.ordered_medicine", entityType: "Admission", entityId: admission.id });
-  res.status(201).json({ ok: true });
-});
-
 /**
  * POST /admissions/:id/discharge
  * Charges for the length of stay (ward's daily rate × nights stayed,
@@ -241,16 +105,36 @@ router.post("/admissions/:id/discharge", requireAuth, requireRole("DOCTOR", "WAR
   if (!admission) return res.status(404).json({ error: "Admission not found" });
   if (admission.dischargedAt) return res.status(400).json({ error: "This admission is already discharged" });
 
-  const result = await prisma.$transaction(async (tx) => dischargeAdmission(tx, admission));
+  const dischargedAt = new Date();
+  const msPerDay = 1000 * 60 * 60 * 24;
+  const nights = Math.max(1, Math.ceil((dischargedAt.getTime() - admission.admittedAt.getTime()) / msPerDay));
+  const wardCharge = Number(admission.bed.ward.dailyRate) * nights;
+
+  await prisma.$transaction(async (tx) => {
+    await tx.admission.update({ where: { id: admission.id }, data: { dischargedAt } });
+    await tx.bed.update({ where: { id: admission.bedId }, data: { status: "AVAILABLE" } });
+    if (wardCharge > 0) {
+      await tx.billingItem.create({
+        data: {
+          encounterId: admission.encounterId,
+          description: `Ward: ${admission.bed.ward.name} — ${nights} night(s) @ ${admission.bed.ward.dailyRate}`,
+          amount: wardCharge,
+          category: "Ward/Admission",
+        },
+      });
+    }
+    await tx.encounter.update({ where: { id: admission.encounterId }, data: { status: "CASHIER" } });
+    await enqueue(tx, admission.encounterId, "CASHIER");
+  });
 
   await logAction({
     userId: req.user!.id,
     action: "ward.discharged_to_billing",
     entityType: "Admission",
     entityId: admission.id,
-    details: result,
+    details: { nights, wardCharge },
   });
-  res.json({ ok: true, ...result });
+  res.json({ ok: true, nights, wardCharge });
 });
 
 export default router;

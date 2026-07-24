@@ -13,11 +13,12 @@ interface StaffUser {
   createdAt: string;
 }
 
-// ADMIN is intentionally left out of this list. Staff accounts created or
-// edited from this page can never be given admin rights — admin access is
-// only ever granted by running the seed/restore script directly against
-// the database, so it's always a deliberate action, not a click here.
-const ROLES: Role[] = ["RECEPTIONIST", "NURSE", "DOCTOR", "LAB_TECH", "PHARMACIST", "CASHIER", "WARD_NURSE", "THEATRE_NURSE"];
+const STAFF_ROLES: Role[] = ["RECEPTIONIST", "NURSE", "DOCTOR", "LAB_TECH", "PHARMACIST", "CASHIER", "WARD_NURSE", "THEATRE_NURSE"];
+// New staff accounts can never be created as Admin from this form — admin
+// rights should only ever be granted deliberately, by promoting an
+// existing account via the role dropdown below (which requires a
+// confirmation and can't be used on your own account).
+const CREATE_ROLES: Role[] = STAFF_ROLES;
 
 export default function Staff() {
   const [users, setUsers] = useState<StaffUser[]>([]);
@@ -111,7 +112,7 @@ export default function Staff() {
             <label className="text-sm">Temporary password<input required minLength={8} value={form.password} onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))} className="mt-1 w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" placeholder="min. 8 characters" /></label>
             <label className="text-sm">Role
               <select value={form.role} onChange={(e) => setForm((f) => ({ ...f, role: e.target.value as Role }))} className="mt-1 w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
-                {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                {CREATE_ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
               </select>
             </label>
             <button disabled={submitting} className="col-span-4 mt-1 bg-teal-800 text-white rounded-lg py-2 text-sm font-medium hover:bg-teal-900 disabled:opacity-50">
@@ -148,13 +149,14 @@ export default function Staff() {
                 <td className="py-2 flex items-center gap-1.5">{u.name} {u.role === "ADMIN" && <ShieldCheck size={13} className="text-teal-700" />}</td>
                 <td className="text-slate-500">{u.email}</td>
                 <td>
-                  {u.role === "ADMIN" ? (
-                    <Badge className="bg-teal-100 text-teal-800 border-teal-300">Admin</Badge>
-                  ) : (
-                    <select value={u.role} onChange={(e) => changeRole(u.id, e.target.value as Role, u.name)} className="text-xs border border-slate-300 rounded px-2 py-1">
-                      {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
-                    </select>
-                  )}
+                  <select value={u.role} onChange={(e) => changeRole(u.id, e.target.value as Role, u.name)} className="text-xs border border-slate-300 rounded px-2 py-1">
+                    <optgroup label="Staff roles">
+                      {STAFF_ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                    </optgroup>
+                    <optgroup label="⚠ Admin">
+                      <option value="ADMIN">ADMIN</option>
+                    </optgroup>
+                  </select>
                 </td>
                 <td>
                   <Badge className={u.active ? "bg-emerald-100 text-emerald-800 border-emerald-300" : "bg-slate-100 text-slate-500 border-slate-300"}>

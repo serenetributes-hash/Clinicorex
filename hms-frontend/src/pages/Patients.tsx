@@ -1,15 +1,10 @@
 import { useState, useEffect } from "react";
-import { Search, Users, Clock, Activity, Stethoscope, FlaskConical, BedDouble } from "lucide-react";
+import { Link } from "react-router-dom";
+import { Search, Users, Clock, Ban, Printer } from "lucide-react";
 import { api, ApiError } from "../api/client";
 import { Card, SectionHeader, Badge, ErrorBanner, money } from "../components/ui";
 import { Patient } from "../types";
 import { useAuth } from "../auth/AuthContext";
-
-// Roles that see full clinical detail (vitals/notes, diagnosis, lab
-// results, nursing notes) on a patient's profile. The backend also
-// enforces this — this just matches it so the UI doesn't show empty
-// sections to reception/cashier.
-const CLINICAL_ROLES = ["ADMIN", "DOCTOR", "NURSE", "LAB_TECH", "PHARMACIST", "WARD_NURSE"];
 
 const STATUS_COLORS: Record<string, string> = {
   REGISTERED: "bg-slate-100 text-slate-700 border-slate-300",
@@ -22,26 +17,29 @@ const STATUS_COLORS: Record<string, string> = {
   AWAITING_THEATRE: "bg-fuchsia-100 text-fuchsia-800 border-fuchsia-300",
   ADMITTED: "bg-indigo-100 text-indigo-800 border-indigo-300",
   DISCHARGED: "bg-emerald-100 text-emerald-800 border-emerald-300",
+  CANCELLED: "bg-slate-200 text-slate-500 border-slate-300",
 };
 
 export default function Patients() {
   const { user } = useAuth();
-  const canSeeClinical = !!user && CLINICAL_ROLES.includes(user.role);
   const [search, setSearch] = useState("");
   const [results, setResults] = useState<Patient[]>([]);
   const [selected, setSelected] = useState<Patient | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!search.trim()) {
-      setResults([]);
-      return;
-    }
+    setLoading(true);
     const handle = setTimeout(async () => {
       try {
+        // Empty search still hits the API — the backend returns the most
+        // recently registered patients when no search term is given, so
+        // the list below is never empty by default.
         setResults(await api.get(`/patients?search=${encodeURIComponent(search.trim())}`));
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Search failed");
+        setError(err instanceof ApiError ? err.message : "Could not load patients");
+      } finally {
+        setLoading(false);
       }
     }, 300);
     return () => clearTimeout(handle);
@@ -52,6 +50,17 @@ export default function Patients() {
       setSelected(await api.get(`/patients/${p.id}`));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not load patient");
+    }
+  };
+
+  const cancelVisit = async (encounterId: string) => {
+    if (!window.confirm("Cancel this visit? This closes it out (frees any bed, cancels queue entries) without deleting the record. Use this only for visits that are stuck with no valid next step.")) return;
+    setError(null);
+    try {
+      await api.post(`/encounters/${encounterId}/cancel`);
+      if (selected) setSelected(await api.get(`/patients/${selected.id}`));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not cancel this visit");
     }
   };
 
@@ -70,15 +79,18 @@ export default function Patients() {
               className="w-full border border-slate-300 rounded-lg pl-8 pr-3 py-2 text-sm"
             />
           </div>
-          {results.length === 0 ? (
-            <p className="text-sm text-slate-400">Search to find a patient.</p>
+          <p className="text-xs text-slate-400 mb-2">{search.trim() ? "Search results" : "Recent patients"}</p>
+          {loading ? (
+            <p className="text-sm text-slate-400">Loading...</p>
+          ) : results.length === 0 ? (
+            <p className="text-sm text-slate-400">No patients found.</p>
           ) : (
             <ul className="space-y-2 max-h-[520px] overflow-auto">
               {results.map((p) => (
                 <li key={p.id}>
                   <button onClick={() => select(p)} className={`w-full text-left px-3 py-2 rounded-lg border text-sm ${selected?.id === p.id ? "border-teal-600 bg-teal-50" : "border-slate-200 hover:bg-slate-50"}`}>
                     <p className="font-medium">{p.firstName} {p.lastName}</p>
-                    <p className="text-xs text-slate-500">{p.mrn}</p>
+                    <p className="text-xs text-slate-500">{p.mrn} · {p.phone || "no phone"}</p>
                   </button>
                 </li>
               ))}
@@ -103,49 +115,29 @@ export default function Patients() {
                   <div key={enc.id} className="border border-slate-200 rounded-lg p-3">
                     <div className="flex justify-between items-center mb-2">
                       <p className="text-sm font-medium">{enc.type} visit — {new Date(enc.registeredAt).toLocaleDateString()}</p>
-                      <Badge className={STATUS_COLORS[enc.status] || "bg-slate-100 text-slate-700 border-slate-300"}>{enc.status}</Badge>
-                    </div>
-                    {enc.chiefComplaint && <p className="text-xs text-slate-500 mb-1">Complaint: {enc.chiefComplaint}</p>}
-
-                    {canSeeClinical && (
-                      <div className="space-y-2 mt-2">
-                        {enc.triage && (enc.triage.bp || enc.triage.notes) && (
-                          <div className="bg-slate-50 rounded-lg px-3 py-2">
-                            <p className="text-xs font-medium text-slate-600 flex items-center gap-1"><Activity size={11} /> Triage</p>
-                            <p className="text-xs text-slate-500 mt-0.5">BP {enc.triage.bp || "—"} · Temp {enc.triage.temp ?? "—"}°C · Pulse {enc.triage.pulse ?? "—"} · SpO2 {enc.triage.spo2 ?? "—"}%</p>
-                            {enc.triage.notes && <p className="text-xs text-slate-500 mt-0.5">{enc.triage.notes}</p>}
-                          </div>
-                        )}
-
-                        {(enc.consultations || []).filter((c: any) => c.diagnosis || c.notes).map((c: any) => (
-                          <div key={c.id} className="bg-slate-50 rounded-lg px-3 py-2">
-                            <p className="text-xs font-medium text-slate-600 flex items-center gap-1"><Stethoscope size={11} /> Doctor's note — {new Date(c.createdAt).toLocaleString()}</p>
-                            {c.diagnosis && <p className="text-xs text-slate-500 mt-0.5">Diagnosis: {c.diagnosis}</p>}
-                            {c.notes && <p className="text-xs text-slate-500 mt-0.5">{c.notes}</p>}
-                          </div>
-                        ))}
-
-                        {(enc.labOrders || []).length > 0 && (
-                          <div className="bg-slate-50 rounded-lg px-3 py-2">
-                            <p className="text-xs font-medium text-slate-600 flex items-center gap-1"><FlaskConical size={11} /> Laboratory</p>
-                            {enc.labOrders.map((o: any) => (
-                              <p key={o.id} className="text-xs text-slate-500 mt-0.5">{o.testName}: {o.result || "Pending"}</p>
-                            ))}
-                          </div>
-                        )}
-
-                        {enc.admission && (
-                          <div className="bg-slate-50 rounded-lg px-3 py-2">
-                            <p className="text-xs font-medium text-slate-600 flex items-center gap-1"><BedDouble size={11} /> Ward stay{enc.admission.bed ? ` — ${enc.admission.bed.ward?.name || ""} bed ${enc.admission.bed.bedNumber}` : ""}</p>
-                            {enc.admission.admittingDiagnosis && <p className="text-xs text-slate-500 mt-0.5">Admitting diagnosis: {enc.admission.admittingDiagnosis}</p>}
-                            {(enc.admission.nursingNotes || []).map((n: any) => (
-                              <p key={n.id} className="text-xs text-slate-500 mt-0.5">{new Date(n.recordedAt).toLocaleString()}: {n.note}</p>
-                            ))}
-                          </div>
+                      <div className="flex items-center gap-2">
+                        <Badge className={STATUS_COLORS[enc.status] || "bg-slate-100 text-slate-700 border-slate-300"}>{enc.status}</Badge>
+                        {user?.role === "ADMIN" && enc.status !== "DISCHARGED" && enc.status !== "CANCELLED" && (
+                          <button onClick={() => cancelVisit(enc.id)} className="text-xs text-rose-600 hover:underline inline-flex items-center gap-0.5">
+                            <Ban size={11} /> Cancel visit
+                          </button>
                         )}
                       </div>
+                    </div>
+                    {enc.chiefComplaint && <p className="text-xs text-slate-500 mb-1">Complaint: {enc.chiefComplaint}</p>}
+                    {enc.triage?.notes && <p className="text-xs text-slate-500 mb-1"><span className="font-medium">Triage:</span> {enc.triage.notes}</p>}
+                    {(enc.consultations || []).map((c: any) => (
+                      (c.diagnosis || c.notes) && (
+                        <p key={c.id} className="text-xs text-slate-500 mb-1"><span className="font-medium">Doctor:</span> {c.diagnosis ? `${c.diagnosis} — ` : ""}{c.notes || ""}</p>
+                      )
+                    ))}
+                    {(enc.notes || []).length > 0 && (
+                      <div className="mt-1.5 mb-1 space-y-1">
+                        {enc.notes.map((n: any) => (
+                          <p key={n.id} className="text-xs bg-slate-50 rounded px-2 py-1"><span className="font-medium text-slate-600">{n.department}:</span> {n.note}</p>
+                        ))}
+                      </div>
                     )}
-
                     {enc.billingItems?.length > 0 && (
                       <div className="mt-2">
                         <p className="text-xs font-medium text-slate-600 mb-1 flex items-center gap-1"><Clock size={11} /> Billing</p>
@@ -172,6 +164,26 @@ export default function Patients() {
                         )}
                       </div>
                     )}
+                    <div className="flex flex-wrap gap-3 mt-3 pt-2 border-t border-slate-100">
+                      <Link to={`/print/${enc.id}?type=summary`} target="_blank" className="text-xs text-teal-700 hover:underline inline-flex items-center gap-1">
+                        <Printer size={12} /> Medical report
+                      </Link>
+                      {enc.billingItems?.length > 0 && (
+                        <Link to={`/print/${enc.id}?type=receipt`} target="_blank" className="text-xs text-teal-700 hover:underline inline-flex items-center gap-1">
+                          <Printer size={12} /> Payment receipt
+                        </Link>
+                      )}
+                      {(enc.status === "DISCHARGED" || (enc.admissions || []).length > 0) && (
+                        <Link to={`/print/${enc.id}?type=discharge`} target="_blank" className="text-xs text-teal-700 hover:underline inline-flex items-center gap-1">
+                          <Printer size={12} /> Discharge summary
+                        </Link>
+                      )}
+                      {(enc.bookings || []).length > 0 && (
+                        <Link to={`/print/${enc.id}?type=theatre`} target="_blank" className="text-xs text-teal-700 hover:underline inline-flex items-center gap-1">
+                          <Printer size={12} /> Theatre record
+                        </Link>
+                      )}
+                    </div>
                   </div>
                 ))}
                 {(!selected.encounters || selected.encounters.length === 0) && (

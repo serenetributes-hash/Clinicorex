@@ -4,8 +4,8 @@ import { Department } from "@prisma/client";
 import { prisma } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { requireRole } from "../middleware/roles";
-import { enqueue, nextAfterLab, dischargeAdmission } from "../utils/workflow";
-import { getConsultationFee, getEmergencyWardVisitFee } from "../utils/catalog";
+import { enqueue, nextAfterConsultation, nextAfterLab } from "../utils/workflow";
+import { CONSULTATION_FEE, LAB_TEST_CATALOG } from "../utils/catalog";
 import { logAction } from "../utils/audit";
 
 const router = Router();
@@ -22,6 +22,75 @@ async function requireClaimedEntry(encounterId: string, department: Department, 
   });
   return entry;
 }
+
+/**
+ * GET /encounters/:id
+ * Full detail for a single visit — everything needed to render any
+ * printable document (medical report, discharge summary, receipt,
+ * theatre record) in one call.
+ */
+router.get("/:id", requireAuth, async (req, res) => {
+  const encounter = await prisma.encounter.findUnique({
+    where: { id: req.params.id },
+    include: {
+      patient: true,
+      triage: true,
+      consultations: { orderBy: { createdAt: "asc" } },
+      labOrders: true,
+      prescriptions: { include: { item: true } },
+      billingItems: true,
+      payment: true,
+      notes: { orderBy: { createdAt: "asc" } },
+      admissions: { include: { bed: { include: { ward: true } } }, orderBy: { admittedAt: "asc" } },
+      bookings: { include: { equipment: true, charges: true } },
+    },
+  });
+  if (!encounter) return res.status(404).json({ error: "Visit not found" });
+  res.json(encounter);
+});
+
+// Maps a staff member's role to a human-readable department label, used to
+// tag notes so a doctor reading the patient's record can see at a glance
+// who left each note.
+const ROLE_DEPARTMENT_LABEL: Record<string, string> = {
+  NURSE: "Triage",
+  DOCTOR: "Consultation",
+  LAB_TECH: "Laboratory",
+  PHARMACIST: "Pharmacy",
+  CASHIER: "Cashier",
+  WARD_NURSE: "Ward",
+  THEATRE_NURSE: "Theatre",
+  RECEPTIONIST: "Reception",
+  ADMIN: "Admin",
+};
+
+const noteSchema = z.object({ note: z.string().min(1) });
+
+/**
+ * POST /encounters/:id/notes
+ * A note any staff member can leave on a patient's visit — tagged with
+ * their department automatically. These show up on the patient's
+ * permanent profile (visible to any doctor) and, for triage/consultation
+ * notes specifically, are also surfaced directly in the consultation
+ * screens for continuity of care.
+ */
+router.post("/:id/notes", requireAuth, async (req: AuthedRequest, res) => {
+  const parsed = noteSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Note text is required" });
+
+  const encounter = await prisma.encounter.findUnique({ where: { id: req.params.id } });
+  if (!encounter) return res.status(404).json({ error: "Encounter not found" });
+
+  const note = await prisma.encounterNote.create({
+    data: {
+      encounterId: req.params.id,
+      department: ROLE_DEPARTMENT_LABEL[req.user!.role] || req.user!.role,
+      authorId: req.user!.id,
+      note: parsed.data.note,
+    },
+  });
+  res.status(201).json(note);
+});
 
 // ---------------- Triage ----------------
 
@@ -62,95 +131,64 @@ router.post("/:id/triage", requireAuth, requireRole("NURSE"), async (req: Authed
 
 // ---------------- Consultation ----------------
 
-/**
- * A doctor seeing a patient fresh from triage picks exactly one of four
- * outcomes:
- *   LABORATORY — order one or more tests, patient goes to the lab queue
- *                and comes back here (as a review) once results are in.
- *   PHARMACY   — prescribe medicine, patient goes straight to pharmacy,
- *                then straight to the cashier once dispensed.
- *   THEATRE    — refer straight to theatre (e.g. obvious trauma/surgical
- *                case that doesn't need labs first).
- *   DISCHARGE  — nothing further needed; patient goes to the cashier for
- *                whatever's already billed (the consultation fee).
- * Admission to the ward isn't offered here on purpose — it happens either
- * after reviewing lab results (see consultation-review below) or after a
- * theatre procedure, never straight off triage.
- */
 const consultationSchema = z.object({
-  decision: z.enum(["LABORATORY", "PHARMACY", "THEATRE", "DISCHARGE"]),
   diagnosis: z.string().optional(),
   notes: z.string().optional(),
-  labTestIds: z.array(z.string()).default([]), // LabTest ids from GET /catalog — required when decision = LABORATORY
-  prescriptions: z.array(z.object({ itemId: z.string(), quantity: z.number().int().min(1) })).default([]), // required when decision = PHARMACY
+  labTestIds: z.array(z.string()).default([]), // keys from LAB_TEST_CATALOG
+  prescriptions: z.array(z.object({ itemId: z.string(), quantity: z.number().int().min(1) })).default([]),
+  // Optional direct routing — used when the doctor doesn't need lab/pharmacy
+  // first and wants to send the patient straight to theatre or discharge
+  // them on this first visit. When set, labTestIds/prescriptions are ignored.
+  decision: z.enum(["THEATRE", "DISCHARGE"]).optional(),
 });
 
 router.post("/:id/consultation", requireAuth, requireRole("DOCTOR"), async (req: AuthedRequest, res) => {
   const encounterId = req.params.id;
   const parsed = consultationSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-  const { decision, diagnosis, notes, labTestIds, prescriptions } = parsed.data;
+  const { diagnosis, notes, decision } = parsed.data;
+  const labTestIds = decision ? [] : parsed.data.labTestIds;
+  const prescriptions = decision ? [] : parsed.data.prescriptions;
 
   const entry = await requireClaimedEntry(encounterId, "CONSULTATION", req.user!.id);
   if (!entry) {
     return res.status(403).json({ error: "You must claim this patient from the consultation queue first" });
   }
 
-  let selectedTests: { id: string; name: string; price: any }[] = [];
-  if (decision === "LABORATORY") {
-    if (labTestIds.length === 0) return res.status(400).json({ error: "Select at least one lab test to send this patient to the laboratory" });
-    selectedTests = await prisma.labTest.findMany({ where: { id: { in: labTestIds }, active: true } });
-    if (selectedTests.length !== labTestIds.length) {
-      return res.status(400).json({ error: "One or more selected lab tests are no longer available" });
-    }
+  for (const testId of labTestIds) {
+    if (!LAB_TEST_CATALOG[testId]) return res.status(400).json({ error: `Unknown lab test "${testId}"` });
   }
-  if (decision === "PHARMACY") {
-    if (prescriptions.length === 0) return res.status(400).json({ error: "Add at least one medicine to send this patient to pharmacy" });
+  if (prescriptions.length > 0) {
     const items = await prisma.inventoryItem.findMany({ where: { id: { in: prescriptions.map((p) => p.itemId) } } });
     if (items.length !== prescriptions.length) {
       return res.status(400).json({ error: "One or more prescribed items don't exist in inventory" });
     }
   }
 
-  const consultationFee = await getConsultationFee();
-
-  const nextDept: Department =
-    decision === "LABORATORY" ? "LABORATORY" :
-    decision === "PHARMACY" ? "PHARMACY" :
-    decision === "THEATRE" ? "THEATRE" : "CASHIER";
-  const nextStatus = decision === "THEATRE" ? "AWAITING_THEATRE" : (nextDept as any);
-
   const result = await prisma.$transaction(async (tx) => {
     await tx.consultation.create({ data: { encounterId, doctorId: req.user!.id, diagnosis, notes } });
     await tx.billingItem.create({
-      data: { encounterId, description: "Consultation fee", amount: consultationFee, category: "Consultation" },
+      data: { encounterId, description: "Consultation fee", amount: CONSULTATION_FEE, category: "Consultation" },
     });
-    if (decision === "LABORATORY") {
-      for (const t of selectedTests) {
-        await tx.labOrder.create({
-          data: { encounterId, testName: t.name, price: t.price, orderedById: req.user!.id },
-        });
-      }
+    for (const testId of labTestIds) {
+      const t = LAB_TEST_CATALOG[testId];
+      await tx.labOrder.create({
+        data: { encounterId, testName: t.name, price: t.price, orderedById: req.user!.id },
+      });
     }
-    if (decision === "PHARMACY") {
-      for (const rx of prescriptions) {
-        await tx.prescription.create({ data: { encounterId, itemId: rx.itemId, quantity: rx.quantity } });
-      }
+    for (const rx of prescriptions) {
+      await tx.prescription.create({ data: { encounterId, itemId: rx.itemId, quantity: rx.quantity } });
     }
 
+    const nextDept: Department = decision === "THEATRE" ? "THEATRE" : decision === "DISCHARGE" ? "CASHIER" : nextAfterConsultation(labTestIds.length > 0, prescriptions.length > 0);
+    const nextStatus = decision === "THEATRE" ? "AWAITING_THEATRE" : (nextDept as any);
     await tx.encounter.update({ where: { id: encounterId }, data: { status: nextStatus } });
     await tx.queueEntry.update({ where: { id: entry.id }, data: { status: "COMPLETED", completedAt: new Date() } });
     await enqueue(tx, encounterId, nextDept);
     return { nextDepartment: nextDept };
   });
 
-  await logAction({
-    userId: req.user!.id,
-    action: "consultation.recorded",
-    entityType: "Encounter",
-    entityId: encounterId,
-    details: { decision },
-  });
+  await logAction({ userId: req.user!.id, action: "consultation.recorded", entityType: "Encounter", entityId: encounterId, details: { decision } });
   res.status(201).json(result);
 });
 
@@ -263,121 +301,6 @@ router.post("/:id/consultation-review", requireAuth, requireRole("DOCTOR"), asyn
   res.json({ ok: true, decision });
 });
 
-// ---------------- Ward round (doctor called to see an admitted patient) ----------------
-
-const wardRoundSchema = z.object({
-  // Same four as first consultation, plus WARD — which here means "no
-  // change needed, back to the ward bed", since the patient is already
-  // admitted (unlike the review screen's WARD, which starts a brand new
-  // admission).
-  decision: z.enum(["LABORATORY", "PHARMACY", "THEATRE", "DISCHARGE", "WARD"]),
-  diagnosis: z.string().optional(),
-  notes: z.string().optional(),
-  labTestIds: z.array(z.string()).default([]),
-  prescriptions: z.array(z.object({ itemId: z.string(), quantity: z.number().int().min(1) })).default([]),
-});
-
-/**
- * POST /:id/ward-round
- * Used when a ward nurse/doctor "calls a doctor" for a patient who is
- * already admitted (see POST /wards/admissions/:id/call-doctor). The
- * patient stays in their bed throughout — this never creates a new
- * admission or frees the bed. The doctor can still order labs, prescribe
- * medicine, refer to theatre, or discharge, exactly like a normal
- * consultation; "WARD" just means "seen, no change — back to the ward".
- */
-router.post("/:id/ward-round", requireAuth, requireRole("DOCTOR"), async (req: AuthedRequest, res) => {
-  const encounterId = req.params.id;
-  const parsed = wardRoundSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-  const { decision, diagnosis, notes, labTestIds, prescriptions } = parsed.data;
-
-  const entry = await requireClaimedEntry(encounterId, "CONSULTATION", req.user!.id);
-  if (!entry) return res.status(403).json({ error: "You must claim this patient from the consultation queue first" });
-
-  const admission = await prisma.admission.findFirst({ where: { encounterId, dischargedAt: null } });
-  if (!admission) return res.status(400).json({ error: "This patient doesn't currently have an active ward admission" });
-
-  let selectedTests: { id: string; name: string; price: any }[] = [];
-  if (decision === "LABORATORY") {
-    if (labTestIds.length === 0) return res.status(400).json({ error: "Select at least one lab test" });
-    selectedTests = await prisma.labTest.findMany({ where: { id: { in: labTestIds }, active: true } });
-    if (selectedTests.length !== labTestIds.length) {
-      return res.status(400).json({ error: "One or more selected lab tests are no longer available" });
-    }
-  }
-  if (decision === "PHARMACY") {
-    if (prescriptions.length === 0) return res.status(400).json({ error: "Add at least one medicine" });
-    const items = await prisma.inventoryItem.findMany({ where: { id: { in: prescriptions.map((p) => p.itemId) } } });
-    if (items.length !== prescriptions.length) {
-      return res.status(400).json({ error: "One or more prescribed items don't exist in inventory" });
-    }
-  }
-
-  const emergencyFee = entry.priority === "EMERGENCY" ? await getEmergencyWardVisitFee() : 0;
-
-  // WARD (stay put) never hands off to another department queue — the
-  // patient's already there. DISCHARGE goes through the same bed-freeing,
-  // nights-stayed billing as a normal ward discharge (see below), not a
-  // simple status change.
-  const nextDept: Department | null =
-    decision === "LABORATORY" ? "LABORATORY" :
-    decision === "PHARMACY" ? "PHARMACY" :
-    decision === "THEATRE" ? "THEATRE" : null;
-  const nextStatus =
-    decision === "THEATRE" ? "AWAITING_THEATRE" :
-    decision === "WARD" ? "ADMITTED" : (nextDept as any);
-
-  const result = await prisma.$transaction(async (tx) => {
-    await tx.consultation.create({ data: { encounterId, doctorId: req.user!.id, diagnosis, notes } });
-
-    // Routine ward rounds aren't billed per visit — they're covered by the
-    // ward's standard daily doctor-round rate, charged automatically at
-    // discharge (see dischargeAdmission), same as the nightly bed rate.
-    // Only a genuine after-hours/emergency call-out (flagged when the
-    // doctor was called, see POST /wards/admissions/:id/call-doctor) adds
-    // a one-off charge here — and it's its own fee, not the outpatient
-    // consultation fee.
-    if (entry.priority === "EMERGENCY") {
-      await tx.billingItem.create({
-        data: { encounterId, description: "Emergency ward visit", amount: emergencyFee, category: "Consultation" },
-      });
-    }
-    if (decision === "LABORATORY") {
-      for (const t of selectedTests) {
-        await tx.labOrder.create({ data: { encounterId, testName: t.name, price: t.price, orderedById: req.user!.id } });
-      }
-    }
-    if (decision === "PHARMACY") {
-      for (const rx of prescriptions) {
-        await tx.prescription.create({ data: { encounterId, itemId: rx.itemId, quantity: rx.quantity } });
-      }
-    }
-
-    if (decision === "DISCHARGE") {
-      const fullAdmission = await tx.admission.findUniqueOrThrow({
-        where: { id: admission.id },
-        include: { bed: { include: { ward: true } } },
-      });
-      await dischargeAdmission(tx, fullAdmission);
-    } else {
-      await tx.encounter.update({ where: { id: encounterId }, data: { status: nextStatus } });
-    }
-    await tx.queueEntry.update({ where: { id: entry.id }, data: { status: "COMPLETED", completedAt: new Date() } });
-    if (nextDept) await enqueue(tx, encounterId, nextDept);
-    return { nextDepartment: decision === "DISCHARGE" ? "CASHIER" : nextDept || "WARD" };
-  });
-
-  await logAction({
-    userId: req.user!.id,
-    action: "ward_round.recorded",
-    entityType: "Encounter",
-    entityId: encounterId,
-    details: { decision },
-  });
-  res.status(201).json(result);
-});
-
 // ---------------- Pharmacy ----------------
 
 router.post("/:id/dispense", requireAuth, requireRole("PHARMACIST"), async (req: AuthedRequest, res) => {
@@ -423,19 +346,9 @@ router.post("/:id/dispense", requireAuth, requireRole("PHARMACIST"), async (req:
         },
       });
     }
-
-    // An inpatient (still on an active ward admission) goes straight back
-    // to their bed after dispensing — not to the cashier, since their stay
-    // isn't over. Everyone else (first-visit or post-lab pharmacy) goes on
-    // to the cashier as normal.
-    const activeAdmission = await tx.admission.findFirst({ where: { encounterId, dischargedAt: null } });
+    await tx.encounter.update({ where: { id: encounterId }, data: { status: "CASHIER" } });
     await tx.queueEntry.update({ where: { id: entry.id }, data: { status: "COMPLETED", completedAt: new Date() } });
-    if (activeAdmission) {
-      await tx.encounter.update({ where: { id: encounterId }, data: { status: "ADMITTED" } });
-    } else {
-      await tx.encounter.update({ where: { id: encounterId }, data: { status: "CASHIER" } });
-      await enqueue(tx, encounterId, "CASHIER");
-    }
+    await enqueue(tx, encounterId, "CASHIER");
   });
 
   await logAction({ userId: req.user!.id, action: "pharmacy.dispensed", entityType: "Encounter", entityId: encounterId });
@@ -443,47 +356,6 @@ router.post("/:id/dispense", requireAuth, requireRole("PHARMACIST"), async (req:
 });
 
 // ---------------- Cashier ----------------
-
-const billingItemSchema = z.union([
-  z.object({ otherFeeId: z.string() }),
-  z.object({ description: z.string().min(1), amount: z.number().min(0) }),
-]);
-
-/**
- * POST /:id/billing-items
- * Adds a one-off charge to a patient's bill before payment — either picked
- * from the admin-maintained OtherFee catalog (Pricing page), or a fully
- * custom description/amount for something truly one-off that isn't worth
- * cataloging. Only usable while the encounter is claimed by this cashier
- * at the Cashier queue, same guard as every other department action.
- */
-router.post("/:id/billing-items", requireAuth, requireRole("CASHIER"), async (req: AuthedRequest, res) => {
-  const encounterId = req.params.id;
-  const parsed = billingItemSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Provide either otherFeeId, or description and amount" });
-
-  const entry = await requireClaimedEntry(encounterId, "CASHIER", req.user!.id);
-  if (!entry) return res.status(403).json({ error: "You must claim this patient from the cashier queue first" });
-
-  let description: string;
-  let amount: number;
-  if ("otherFeeId" in parsed.data) {
-    const fee = await prisma.otherFee.findUnique({ where: { id: parsed.data.otherFeeId } });
-    if (!fee || !fee.active) return res.status(400).json({ error: "This fee is no longer available" });
-    description = fee.name;
-    amount = Number(fee.price);
-  } else {
-    description = parsed.data.description;
-    amount = parsed.data.amount;
-  }
-
-  const item = await prisma.billingItem.create({
-    data: { encounterId, description, amount, category: "Other" },
-  });
-
-  await logAction({ userId: req.user!.id, action: "billing_item.added", entityType: "Encounter", entityId: encounterId, details: { description, amount } });
-  res.status(201).json(item);
-});
 
 const paymentSchema = z.object({
   method: z.enum(["CASH", "INSURANCE"]),
@@ -565,6 +437,47 @@ router.patch("/:id/claim-status", requireAuth, requireRole("CASHIER"), async (re
   });
 
   res.json(updated);
+});
+
+// ---------------- Admin recovery ----------------
+
+/**
+ * POST /encounters/:id/cancel
+ * Admin-only escape hatch for a visit that's gotten stuck (e.g. a bed
+ * mix-up, a workflow change mid-visit, or any other edge case that leaves
+ * a patient with no valid next step). This doesn't delete anything —
+ * healthcare records shouldn't just vanish — it closes out the visit
+ * cleanly: cancels any active queue entries, frees any bed still tied to
+ * an open admission, cancels any pending theatre bookings, and marks the
+ * encounter CANCELLED. The patient can then be registered for a fresh
+ * visit if they still need care.
+ */
+router.post("/:id/cancel", requireAuth, requireRole("ADMIN"), async (req: AuthedRequest, res) => {
+  const encounter = await prisma.encounter.findUnique({ where: { id: req.params.id } });
+  if (!encounter) return res.status(404).json({ error: "Encounter not found" });
+  if (encounter.status === "DISCHARGED" || encounter.status === "CANCELLED") {
+    return res.status(400).json({ error: `This visit is already ${encounter.status.toLowerCase()}` });
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.queueEntry.updateMany({
+      where: { encounterId: encounter.id, status: { in: ["WAITING", "CLAIMED"] } },
+      data: { status: "CANCELLED" },
+    });
+    const openAdmissions = await tx.admission.findMany({ where: { encounterId: encounter.id, dischargedAt: null } });
+    for (const a of openAdmissions) {
+      await tx.admission.update({ where: { id: a.id }, data: { dischargedAt: new Date() } });
+      await tx.bed.update({ where: { id: a.bedId }, data: { status: "AVAILABLE" } });
+    }
+    await tx.booking.updateMany({
+      where: { encounterId: encounter.id, status: { in: ["Scheduled", "In progress"] } },
+      data: { status: "Cancelled" },
+    });
+    await tx.encounter.update({ where: { id: encounter.id }, data: { status: "CANCELLED" } });
+  });
+
+  await logAction({ userId: req.user!.id, action: "encounter.force_cancelled", entityType: "Encounter", entityId: encounter.id });
+  res.json({ ok: true });
 });
 
 export default router;

@@ -1,7 +1,7 @@
 import { NavLink, Outlet, Link } from "react-router-dom";
 import {
   LayoutDashboard, UserPlus, Activity, Stethoscope, FlaskConical, Pill,
-  Wallet, CalendarClock, Boxes, BedDouble, BarChart3, LogOut, Users, KeyRound, ShieldCheck, Tags,
+  Wallet, CalendarClock, Boxes, BedDouble, BarChart3, LogOut, Users, KeyRound, ShieldCheck,
 } from "lucide-react";
 import { useAuth } from "../auth/AuthContext";
 import { Role } from "../types";
@@ -26,7 +26,6 @@ const NAV: NavItem[] = [
   { to: "/theatre", label: "Theatre & equipment", icon: CalendarClock, roles: ["DOCTOR", "NURSE", "WARD_NURSE", "THEATRE_NURSE", "ADMIN"] },
   { to: "/wards", label: "Wards", icon: BedDouble, roles: ["DOCTOR", "NURSE", "WARD_NURSE", "ADMIN"] },
   { to: "/inventory", label: "Inventory", icon: Boxes, roles: ["PHARMACIST", "ADMIN"] },
-  { to: "/pricing", label: "Pricing", icon: Tags, roles: ["ADMIN"] },
   { to: "/staff", label: "Staff", icon: ShieldCheck, roles: ["ADMIN"] },
 ];
 

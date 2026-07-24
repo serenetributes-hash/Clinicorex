@@ -3,11 +3,11 @@ import { QueueBoard } from "../components/QueueBoard";
 import { api, ApiError } from "../api/client";
 import { QueueEntry } from "../types";
 import { Badge, ErrorBanner } from "../components/ui";
+import { NoteBox } from "../components/NoteBox";
 
 function PharmacyPanel({ entry, onDone }: { entry: QueueEntry; onDone: () => void }) {
   const p = entry.encounter.patient!;
   const prescriptions = (entry.encounter.prescriptions || []).filter((rx) => !rx.dispensed);
-  const isInpatient = !!entry.encounter.admission && !entry.encounter.admission.dischargedAt;
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -26,8 +26,7 @@ function PharmacyPanel({ entry, onDone }: { entry: QueueEntry; onDone: () => voi
 
   return (
     <div>
-      <p className="font-medium mb-1">{p.firstName} {p.lastName} <span className="text-slate-400 font-normal text-sm">({p.mrn})</span></p>
-      {isInpatient && <p className="text-xs text-slate-500 mb-3">Inpatient — will return to their ward bed after dispensing.</p>}
+      <p className="font-medium mb-3">{p.firstName} {p.lastName} <span className="text-slate-400 font-normal text-sm">({p.mrn})</span></p>
       <ErrorBanner message={error} />
       {prescriptions.length === 0 ? (
         <p className="text-sm text-slate-400 mb-4">No pending prescriptions for this patient.</p>
@@ -53,8 +52,9 @@ function PharmacyPanel({ entry, onDone }: { entry: QueueEntry; onDone: () => voi
         disabled={submitting || prescriptions.length === 0}
         className="bg-teal-800 text-white rounded-lg py-2.5 px-5 text-sm font-medium hover:bg-teal-900 disabled:opacity-50"
       >
-        {submitting ? "Dispensing..." : isInpatient ? "Dispense & return to ward" : "Dispense & send to cashier"}
+        {submitting ? "Dispensing..." : "Dispense & send to cashier"}
       </button>
+      <NoteBox encounterId={entry.encounterId} existingNotes={entry.encounter.notes} />
     </div>
   );
 }

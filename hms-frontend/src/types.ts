@@ -52,45 +52,35 @@ export interface BillingItem {
   category?: string;
 }
 
-export interface ConsultationNote {
+export interface ConsultationRecord {
   id: string;
   doctorId?: string;
-  diagnosis?: string | null;
-  notes?: string | null;
+  diagnosis?: string;
+  notes?: string;
   createdAt: string;
 }
 
-export interface NursingNote {
+export interface EncounterNote {
   id: string;
+  department: string;
+  authorId?: string;
   note: string;
-  recordedById?: string;
-  recordedAt: string;
-}
-
-export interface Admission {
-  id: string;
-  admittedAt: string;
-  dischargedAt?: string | null;
-  admittingDiagnosis?: string | null;
-  bed?: { bedNumber: string; ward?: { name: string } };
-  nursingNotes?: NursingNote[];
+  createdAt: string;
 }
 
 export interface Encounter {
   id: string;
   patientId: string;
   status: string;
-  type?: string;
-  registeredAt?: string;
   chiefComplaint?: string;
   patient?: Patient;
   triage?: TriageRecord;
-  consultations?: ConsultationNote[];
+  consultations?: ConsultationRecord[];
   labOrders?: LabOrder[];
   prescriptions?: Prescription[];
   billingItems?: BillingItem[];
   payment?: any;
-  admission?: Admission | null;
+  notes?: EncounterNote[];
 }
 
 export interface QueueEntry {

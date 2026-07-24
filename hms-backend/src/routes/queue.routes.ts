@@ -30,11 +30,11 @@ router.get("/:department", requireAuth, async (req: AuthedRequest, res) => {
           include: {
             patient: true,
             triage: true,
-            consultations: { orderBy: { createdAt: "desc" }, take: 1 },
             labOrders: true,
+            consultations: true,
             prescriptions: { include: { item: true } },
             billingItems: true,
-            admission: { include: { bed: { include: { ward: true } } } },
+            notes: { orderBy: { createdAt: "asc" } },
           },
         },
       },
@@ -47,11 +47,11 @@ router.get("/:department", requireAuth, async (req: AuthedRequest, res) => {
           include: {
             patient: true,
             triage: true,
-            consultations: { orderBy: { createdAt: "desc" }, take: 1 },
             labOrders: true,
+            consultations: true,
             prescriptions: { include: { item: true } },
             billingItems: true,
-            admission: { include: { bed: { include: { ward: true } } } },
+            notes: { orderBy: { createdAt: "asc" } },
           },
         },
       },
@@ -87,7 +87,7 @@ router.post("/:id/claim", requireAuth, async (req: AuthedRequest, res) => {
     where: { id },
     include: {
       encounter: {
-        include: { patient: true, triage: true, consultations: { orderBy: { createdAt: "desc" }, take: 1 }, labOrders: true, prescriptions: { include: { item: true } }, billingItems: true, admission: { include: { bed: { include: { ward: true } } } } },
+        include: { patient: true, triage: true, labOrders: true, consultations: true, prescriptions: { include: { item: true } }, billingItems: true, notes: { orderBy: { createdAt: "asc" } } },
       },
     },
   });

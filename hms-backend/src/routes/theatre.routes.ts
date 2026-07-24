@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { Department } from "@prisma/client";
 import { prisma } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { requireRole } from "../middleware/roles";
@@ -12,52 +13,6 @@ const router = Router();
 router.get("/equipment", requireAuth, async (_req, res) => {
   const equipment = await prisma.equipment.findMany({ include: { feeItems: true } });
   res.json(equipment);
-});
-
-const createEquipmentSchema = z.object({
-  name: z.string().min(1),
-  type: z.string().min(1),
-  feeItems: z.array(z.object({ label: z.string().min(1), defaultAmount: z.number().min(0) })).default([]),
-});
-
-/** POST /theatre/equipment — admin only: add a new theatre/machine with its default fee items */
-router.post("/equipment", requireAuth, requireRole("ADMIN"), async (req: AuthedRequest, res) => {
-  const parsed = createEquipmentSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-
-  const equipment = await prisma.equipment.create({
-    data: { name: parsed.data.name, type: parsed.data.type, feeItems: { create: parsed.data.feeItems } },
-    include: { feeItems: true },
-  });
-  await logAction({ userId: req.user!.id, action: "equipment.created", entityType: "Equipment", entityId: equipment.id });
-  res.status(201).json(equipment);
-});
-
-const feeItemSchema = z.object({ label: z.string().min(1), defaultAmount: z.number().min(0) });
-
-/** POST /theatre/equipment/:id/fee-items — admin only: add a new billable line to existing equipment */
-router.post("/equipment/:id/fee-items", requireAuth, requireRole("ADMIN"), async (req: AuthedRequest, res) => {
-  const parsed = feeItemSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-
-  const equipment = await prisma.equipment.findUnique({ where: { id: req.params.id } });
-  if (!equipment) return res.status(404).json({ error: "Equipment/theatre not found" });
-
-  const feeItem = await prisma.equipmentFeeItem.create({ data: { equipmentId: equipment.id, ...parsed.data } });
-  await logAction({ userId: req.user!.id, action: "equipment.fee_item_added", entityType: "Equipment", entityId: equipment.id });
-  res.status(201).json(feeItem);
-});
-
-/** PATCH /theatre/fee-items/:id — admin only: change a fee item's default amount or label */
-router.patch("/fee-items/:id", requireAuth, requireRole("ADMIN"), async (req: AuthedRequest, res) => {
-  const parsed = feeItemSchema.partial().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
-
-  const feeItem = await prisma.equipmentFeeItem.update({ where: { id: req.params.id }, data: parsed.data }).catch(() => null);
-  if (!feeItem) return res.status(404).json({ error: "Fee item not found" });
-
-  await logAction({ userId: req.user!.id, action: "equipment.fee_item_updated", entityType: "EquipmentFeeItem", entityId: feeItem.id });
-  res.json(feeItem);
 });
 
 const bookingSchema = z.object({
@@ -160,24 +115,23 @@ router.post("/bookings/:id/claim", requireAuth, requireRole("DOCTOR", "NURSE", "
   res.json(updated);
 });
 
-const completeBookingSchema = z.object({
-  // Only meaningful (and required) when the booking is linked to a patient
-  // encounter: WARD sends the patient to recover under monitoring, DISCHARGE
-  // sends them straight to the cashier for final billing.
-  decision: z.enum(["WARD", "DISCHARGE"]).optional(),
+const completeSchema = z.object({
+  decision: z.enum(["WARD", "CASHIER"]),
+  notes: z.string().optional(),
 });
 
 /**
  * POST /theatre/bookings/:id/complete
  * Posts the itemized charges to the patient's bill, closes out the queue
- * entry, and — for a case linked to a patient — moves the patient on to
- * either the Ward (for post-op recovery/monitoring) or the Cashier (if
- * they're being discharged straight after the procedure). Only the staff
- * member who claimed it (or an admin) can complete it.
+ * entry, and — this is required, not optional — decides what happens to
+ * the patient next: recover in a ward, or go straight to the cashier if
+ * no admission is needed. Without this the patient had no way forward
+ * after surgery.
  */
 router.post("/bookings/:id/complete", requireAuth, requireRole("DOCTOR", "NURSE", "THEATRE_NURSE"), async (req: AuthedRequest, res) => {
-  const parsed = completeBookingSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  const parsed = completeSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Choose whether this patient goes to a ward or straight to the cashier" });
+  const { decision, notes } = parsed.data;
 
   const booking = await prisma.booking.findUnique({
     where: { id: req.params.id },
@@ -186,10 +140,6 @@ router.post("/bookings/:id/complete", requireAuth, requireRole("DOCTOR", "NURSE"
   if (!booking) return res.status(404).json({ error: "Booking not found" });
 
   if (booking.encounterId) {
-    if (!parsed.data.decision) {
-      return res.status(400).json({ error: "Choose whether this patient recovers in the ward or is discharged" });
-    }
-
     const queueEntry = await prisma.queueEntry.findFirst({
       where: { encounterId: booking.encounterId, department: "THEATRE", status: "CLAIMED" },
     });
@@ -198,8 +148,8 @@ router.post("/bookings/:id/complete", requireAuth, requireRole("DOCTOR", "NURSE"
       return res.status(403).json({ error: "Only the staff member who claimed this case can complete it" });
     }
 
-    const nextDept = parsed.data.decision === "WARD" ? "WARD" : "CASHIER";
-    const nextStatus = parsed.data.decision === "WARD" ? "AWAITING_ADMISSION" : "CASHIER";
+    const nextDept: Department = decision === "WARD" ? "WARD" : "CASHIER";
+    const nextStatus = decision === "WARD" ? "AWAITING_ADMISSION" : "CASHIER";
 
     await prisma.$transaction(async (tx) => {
       for (const charge of booking.charges) {
@@ -212,26 +162,22 @@ router.post("/bookings/:id/complete", requireAuth, requireRole("DOCTOR", "NURSE"
           },
         });
       }
+      if (notes) {
+        await tx.encounterNote.create({
+          data: { encounterId: booking.encounterId as string, department: "Theatre", authorId: req.user!.id, note: notes },
+        });
+      }
       await tx.queueEntry.update({ where: { id: queueEntry.id }, data: { status: "COMPLETED", completedAt: new Date() } });
       await tx.booking.update({ where: { id: booking.id }, data: { status: "Completed" } });
-      await tx.encounter.update({ where: { id: booking.encounterId as string }, data: { status: nextStatus } });
+      await tx.encounter.update({ where: { id: booking.encounterId as string }, data: { status: nextStatus as any } });
       await enqueue(tx, booking.encounterId as string, nextDept);
     });
-
-    await logAction({
-      userId: req.user!.id,
-      action: "theatre.completed",
-      entityType: "Booking",
-      entityId: booking.id,
-      details: { decision: parsed.data.decision },
-    });
-    return res.json({ ok: true, decision: parsed.data.decision });
+  } else {
+    await prisma.booking.update({ where: { id: booking.id }, data: { status: "Completed" } });
   }
 
-  // Unassigned block (no patient attached) — just closes out the booking.
-  await prisma.booking.update({ where: { id: booking.id }, data: { status: "Completed" } });
-  await logAction({ userId: req.user!.id, action: "theatre.completed", entityType: "Booking", entityId: booking.id });
-  res.json({ ok: true });
+  await logAction({ userId: req.user!.id, action: "theatre.completed", entityType: "Booking", entityId: booking.id, details: { decision } });
+  res.json({ ok: true, decision });
 });
 
 router.post("/bookings/:id/cancel", requireAuth, requireRole("DOCTOR", "NURSE", "WARD_NURSE", "THEATRE_NURSE"), async (req: AuthedRequest, res) => {

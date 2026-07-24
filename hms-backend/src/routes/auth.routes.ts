@@ -35,18 +35,11 @@ const token = (jwt.sign as any)(
   res.json({ token, user: { id: user.id, name: user.name, role: user.role, email: user.email } });
 });
 
-// NOTE: "ADMIN" is deliberately excluded here. Staff created through the
-// app can never be given admin rights — admin accounts are only ever
-// created via the seed script (or the one-off restore script), so that
-// granting admin access is always a deliberate, out-of-band action and
-// never a misclick in this form.
-const STAFF_ROLES = ["RECEPTIONIST", "NURSE", "DOCTOR", "LAB_TECH", "PHARMACIST", "CASHIER", "WARD_NURSE", "THEATRE_NURSE"] as const;
-
 const createUserSchema = z.object({
   name: z.string().min(1),
   email: z.string().email(),
   password: z.string().min(8, "Password must be at least 8 characters"),
-  role: z.enum(STAFF_ROLES),
+  role: z.enum(["ADMIN", "RECEPTIONIST", "NURSE", "DOCTOR", "LAB_TECH", "PHARMACIST", "CASHIER", "WARD_NURSE", "THEATRE_NURSE"]),
 });
 
 // Only an existing admin can create staff accounts — run the seed script
@@ -78,11 +71,9 @@ router.get("/users", requireAuth, requireRole("ADMIN"), async (_req, res) => {
   res.json(users);
 });
 
-// Same reasoning as STAFF_ROLES above: an existing user's role can be
-// changed between non-admin roles here, but never promoted to ADMIN.
 const updateUserSchema = z.object({
   name: z.string().min(1).optional(),
-  role: z.enum(STAFF_ROLES).optional(),
+  role: z.enum(["ADMIN", "RECEPTIONIST", "NURSE", "DOCTOR", "LAB_TECH", "PHARMACIST", "CASHIER", "WARD_NURSE", "THEATRE_NURSE"]).optional(),
   active: z.boolean().optional(),
 });
 
@@ -95,8 +86,23 @@ router.patch("/users/:id", requireAuth, requireRole("ADMIN"), async (req: Authed
   if (parsed.data.active === false && req.params.id === req.user!.id) {
     return res.status(400).json({ error: "You can't deactivate your own account" });
   }
-  if (parsed.data.role && req.params.id === req.user!.id) {
-    return res.status(400).json({ error: "You can't change your own role" });
+  if (parsed.data.role && parsed.data.role !== "ADMIN" && req.params.id === req.user!.id) {
+    return res.status(400).json({ error: "You can't change your own role away from admin" });
+  }
+
+  // Never allow the last active admin to be demoted or deactivated —
+  // that's exactly the lockout scenario that's already happened once.
+  const isRemovingAdminRights = (parsed.data.role && parsed.data.role !== "ADMIN") || parsed.data.active === false;
+  if (isRemovingAdminRights) {
+    const target = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (target?.role === "ADMIN" && target.active) {
+      const otherActiveAdmins = await prisma.user.count({
+        where: { role: "ADMIN", active: true, id: { not: req.params.id } },
+      });
+      if (otherActiveAdmins === 0) {
+        return res.status(400).json({ error: "This is the last active admin account — create another admin before changing this one" });
+      }
+    }
   }
 
   const user = await prisma.user.update({

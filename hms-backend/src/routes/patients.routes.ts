@@ -132,14 +132,8 @@ router.get("/", requireAuth, async (req: AuthedRequest, res) => {
   res.json(patients);
 });
 
-// Roles that should see full clinical detail (vitals notes, diagnosis,
-// consultation notes, lab results, nursing notes) on a patient's profile.
-// Reception and cashier still see the visit timeline, status, and billing —
-// just not the clinical free-text, since that's not their job to read.
-const CLINICAL_ROLES = ["ADMIN", "DOCTOR", "NURSE", "LAB_TECH", "PHARMACIST", "WARD_NURSE"];
-
 /** GET /patients/:id — full history for the patient timeline view */
-router.get("/:id", requireAuth, async (req: AuthedRequest, res) => {
+router.get("/:id", requireAuth, async (req, res) => {
   const patient = await prisma.patient.findUnique({
     where: { id: req.params.id },
     include: {
@@ -152,30 +146,14 @@ router.get("/:id", requireAuth, async (req: AuthedRequest, res) => {
           prescriptions: { include: { item: true } },
           billingItems: true,
           payment: true,
-          admission: { include: { bed: { include: { ward: true } }, nursingNotes: true } },
+          admissions: { include: { bed: { include: { ward: true } } }, orderBy: { admittedAt: "asc" } },
+          notes: { orderBy: { createdAt: "asc" } },
         },
       },
     },
   });
   if (!patient) return res.status(404).json({ error: "Patient not found" });
-
-  if (CLINICAL_ROLES.includes(req.user!.role)) {
-    return res.json(patient);
-  }
-
-  // Non-clinical viewer: strip free-text clinical content, keep everything
-  // administrative (status, billing, who/when) intact.
-  const sanitized = {
-    ...patient,
-    encounters: patient.encounters.map((enc) => ({
-      ...enc,
-      triage: enc.triage ? { ...enc.triage, notes: null } : enc.triage,
-      consultations: enc.consultations.map((c) => ({ ...c, notes: null, diagnosis: null })),
-      labOrders: enc.labOrders.map((o) => ({ ...o, result: null })),
-      admission: enc.admission ? { ...enc.admission, admittingDiagnosis: null, nursingNotes: [] } : enc.admission,
-    })),
-  };
-  res.json(sanitized);
+  res.json(patient);
 });
 
 export default router;

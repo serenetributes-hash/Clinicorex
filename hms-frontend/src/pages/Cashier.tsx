@@ -1,89 +1,13 @@
-import { useState, useEffect, FormEvent } from "react";
-import { Plus } from "lucide-react";
+import { useState, FormEvent } from "react";
+import { Link } from "react-router-dom";
+import { Receipt, Printer } from "lucide-react";
 import { QueueBoard } from "../components/QueueBoard";
 import { api, ApiError } from "../api/client";
-import { QueueEntry } from "../types";
-import { ErrorBanner, money } from "../components/ui";
+import { QueueEntry, Patient } from "../types";
+import { Card, Badge, ErrorBanner, money } from "../components/ui";
+import { PatientPicker } from "../components/PatientPicker";
 
-interface OtherFee { id: string; name: string; price: number; }
-
-function AddFee({ entry, refresh }: { entry: QueueEntry; refresh: () => void }) {
-  const [catalog, setCatalog] = useState<OtherFee[]>([]);
-  const [otherFeeId, setOtherFeeId] = useState("");
-  const [customDescription, setCustomDescription] = useState("");
-  const [customAmount, setCustomAmount] = useState("");
-  const [open, setOpen] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-
-  useEffect(() => {
-    (async () => setCatalog((await api.get("/catalog")).otherFees))();
-  }, []);
-
-  const addFromCatalog = async (id: string) => {
-    if (!id) return;
-    setError(null);
-    setSubmitting(true);
-    try {
-      await api.post(`/encounters/${entry.encounterId}/billing-items`, { otherFeeId: id });
-      setOtherFeeId("");
-      refresh();
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not add this fee");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const addCustom = async (e: FormEvent) => {
-    e.preventDefault();
-    const amount = Number(customAmount);
-    if (!customDescription || !Number.isFinite(amount) || amount < 0) return;
-    setError(null);
-    setSubmitting(true);
-    try {
-      await api.post(`/encounters/${entry.encounterId}/billing-items`, { description: customDescription, amount });
-      setCustomDescription("");
-      setCustomAmount("");
-      setOpen(false);
-      refresh();
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not add this charge");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <div className="mb-3">
-      <ErrorBanner message={error} />
-      <div className="flex gap-1.5">
-        <select
-          value={otherFeeId}
-          onChange={(e) => { setOtherFeeId(e.target.value); addFromCatalog(e.target.value); }}
-          disabled={submitting}
-          className="flex-1 border border-slate-300 rounded-lg px-2 py-1.5 text-xs"
-          defaultValue=""
-        >
-          <option value="" disabled>Add a fee...</option>
-          {catalog.map((f) => <option key={f.id} value={f.id}>{f.name} ({money(f.price)})</option>)}
-        </select>
-        <button type="button" onClick={() => setOpen((o) => !o)} className="text-xs bg-slate-100 text-slate-700 rounded-lg px-2.5 py-1.5 hover:bg-slate-200 inline-flex items-center gap-1">
-          <Plus size={12} /> Custom
-        </button>
-      </div>
-      {open && (
-        <form onSubmit={addCustom} className="flex gap-1.5 mt-1.5">
-          <input value={customDescription} onChange={(e) => setCustomDescription(e.target.value)} placeholder="Description" className="flex-1 border border-slate-300 rounded-lg px-2 py-1.5 text-xs" />
-          <input type="number" min={0} value={customAmount} onChange={(e) => setCustomAmount(e.target.value)} placeholder="KSh" className="w-20 border border-slate-300 rounded-lg px-2 py-1.5 text-xs" />
-          <button disabled={submitting} className="text-xs bg-teal-800 text-white rounded-lg px-2.5 py-1.5 hover:bg-teal-900 disabled:opacity-50">Add</button>
-        </form>
-      )}
-    </div>
-  );
-}
-
-function CashierForm({ entry, onDone, refresh }: { entry: QueueEntry; onDone: () => void; refresh: () => void }) {
+function CashierForm({ entry, onDone }: { entry: QueueEntry; onDone: () => void }) {
   const p = entry.encounter.patient!;
   const items = entry.encounter.billingItems || [];
   const total = items.reduce((s, i) => s + Number(i.amount), 0);
@@ -115,6 +39,13 @@ function CashierForm({ entry, onDone, refresh }: { entry: QueueEntry; onDone: ()
     <form onSubmit={submit}>
       <p className="font-medium mb-3">{p.firstName} {p.lastName} <span className="text-slate-400 font-normal text-sm">({p.mrn})</span></p>
       <ErrorBanner message={error} />
+      {(entry.encounter.notes || []).length > 0 && (
+        <div className="mb-3 space-y-1">
+          {entry.encounter.notes!.map((n) => (
+            <p key={n.id} className="text-xs bg-slate-50 rounded-lg px-2.5 py-1.5"><span className="font-medium text-slate-600">{n.department}:</span> {n.note}</p>
+          ))}
+        </div>
+      )}
       <table className="w-full text-sm mb-3">
         <tbody>
           {items.map((it) => (
@@ -129,7 +60,6 @@ function CashierForm({ entry, onDone, refresh }: { entry: QueueEntry; onDone: ()
           </tr>
         </tbody>
       </table>
-      <AddFee entry={entry} refresh={refresh} />
       <div className="flex gap-4 mb-3">
         <label className="text-sm flex items-center gap-1.5"><input type="radio" checked={method === "CASH"} onChange={() => setMethod("CASH")} /> Cash</label>
         <label className="text-sm flex items-center gap-1.5"><input type="radio" checked={method === "INSURANCE"} onChange={() => setMethod("INSURANCE")} /> Insurance</label>
@@ -148,13 +78,88 @@ function CashierForm({ entry, onDone, refresh }: { entry: QueueEntry; onDone: ()
   );
 }
 
+// ---------------- Look up any patient's payment history / receipts ----------------
+
+const STATUS_BADGE: Record<string, string> = {
+  DISCHARGED: "bg-emerald-100 text-emerald-800 border-emerald-300",
+  CASHIER: "bg-orange-100 text-orange-800 border-orange-300",
+};
+
+function PaymentLookup() {
+  const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
+  const [detail, setDetail] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const pick = async (p: Patient) => {
+    setSelectedPatient(p);
+    setError(null);
+    try {
+      setDetail(await api.get(`/patients/${p.id}`));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not load this patient's records");
+    }
+  };
+
+  const billedEncounters = (detail?.encounters || []).filter((e: any) => (e.billingItems || []).length > 0);
+
+  return (
+    <Card className="mt-5">
+      <p className="font-medium text-sm mb-3 flex items-center gap-1.5"><Receipt size={15} /> Look up a patient's payment / receipt</p>
+      <ErrorBanner message={error} />
+      {!selectedPatient ? (
+        <PatientPicker onSelect={pick} placeholder="Search by name, MRN, phone, or ID number..." />
+      ) : (
+        <div>
+          <div className="flex items-center justify-between bg-slate-50 rounded-lg px-3 py-2 mb-3">
+            <span className="text-sm">{selectedPatient.firstName} {selectedPatient.lastName} ({selectedPatient.mrn})</span>
+            <button onClick={() => { setSelectedPatient(null); setDetail(null); }} className="text-xs text-slate-400 hover:text-rose-600">Change</button>
+          </div>
+          {!detail ? (
+            <p className="text-sm text-slate-400">Loading...</p>
+          ) : billedEncounters.length === 0 ? (
+            <p className="text-sm text-slate-400">No billed visits found for this patient.</p>
+          ) : (
+            <ul className="space-y-2">
+              {billedEncounters.map((enc: any) => {
+                const total = enc.billingItems.reduce((s: number, i: any) => s + Number(i.amount), 0);
+                return (
+                  <li key={enc.id} className="border border-slate-200 rounded-lg px-3 py-2 text-sm">
+                    <div className="flex justify-between items-center">
+                      <span>{new Date(enc.registeredAt).toLocaleDateString()} — {enc.type}</span>
+                      <Badge className={STATUS_BADGE[enc.status] || "bg-slate-100 text-slate-700 border-slate-300"}>{enc.status}</Badge>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Total {money(total)} —{" "}
+                      {enc.payment
+                        ? enc.payment.method === "CASH"
+                          ? `Paid in cash${enc.payment.paidAt ? ` on ${new Date(enc.payment.paidAt).toLocaleDateString()}` : ""}`
+                          : `Insurance (${enc.payment.insuranceProvider || "—"}) — claim #${enc.payment.claimNo || "—"} — ${enc.payment.claimStatus}`
+                        : "Not yet paid"}
+                    </p>
+                    <Link to={`/print/${enc.id}?type=receipt`} target="_blank" className="text-xs text-teal-700 hover:underline inline-flex items-center gap-1 mt-1.5">
+                      <Printer size={12} /> View / print receipt
+                    </Link>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export default function Cashier() {
   return (
-    <QueueBoard
-      department="CASHIER"
-      title="Cashier"
-      subtitle="Generate invoice and capture payment"
-      renderAction={(entry, onDone, refresh) => <CashierForm entry={entry} onDone={onDone} refresh={refresh} />}
-    />
+    <div>
+      <QueueBoard
+        department="CASHIER"
+        title="Cashier"
+        subtitle="Generate invoice and capture payment"
+        renderAction={(entry, onDone) => <CashierForm entry={entry} onDone={onDone} />}
+      />
+      <PaymentLookup />
+    </div>
   );
 }

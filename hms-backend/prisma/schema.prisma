@@ -156,8 +156,9 @@ model Encounter {
   billingItems   BillingItem[]
   payment        Payment?
   queueEntries   QueueEntry[]
-  admission      Admission?
+  admissions     Admission[]
   bookings       Booking[]
+  notes          EncounterNote[]
 
   @@index([status])
   @@index([patientId])
@@ -223,28 +224,6 @@ model LabOrder {
   resultedById String?
   orderedAt   DateTime       @default(now())
   resultedAt  DateTime?
-}
-
-// The lab test menu doctors order from — editable by an admin (Pricing
-// page) instead of being fixed in code. "active: false" retires a test
-// without deleting history — old LabOrders keep their own testName/price
-// snapshot regardless, so retiring one never rewrites past bills.
-model LabTest {
-  id     String  @id @default(cuid())
-  name   String  @unique
-  price  Decimal @db.Decimal(10, 2)
-  active Boolean @default(true)
-}
-
-// A catalog of miscellaneous named charges (e.g. "Medical report fee",
-// "Ambulance fee", "Dressing fee") for things that don't fit consultation,
-// lab, pharmacy, theatre, or ward billing — added to a bill from Cashier.
-// Same "active" retirement pattern as LabTest.
-model OtherFee {
-  id     String  @id @default(cuid())
-  name   String  @unique
-  price  Decimal @db.Decimal(10, 2)
-  active Boolean @default(true)
 }
 
 // ---------------- Pharmacy & stock ----------------
@@ -378,12 +357,11 @@ model Expense {
 // ---------------- Inpatient / wards ----------------
 
 model Ward {
-  id             String  @id @default(cuid())
-  name           String
-  type           String? // e.g. "General", "Maternity", "ICU", "Pediatric"
-  dailyRate      Decimal @default(0) @db.Decimal(10, 2) // bed/board, charged per day of stay, in KES
-  doctorRoundFee Decimal @default(0) @db.Decimal(10, 2) // standard daily rate for a doctor's routine ward round, in KES — separate from dailyRate and from the outpatient consultation fee
-  beds           Bed[]
+  id        String  @id @default(cuid())
+  name      String
+  type      String? // e.g. "General", "Maternity", "ICU", "Pediatric"
+  dailyRate Decimal @default(0) @db.Decimal(10, 2) // charged per day of stay, in KES
+  beds      Bed[]
 }
 
 model Bed {
@@ -401,7 +379,7 @@ model Bed {
 model Admission {
   id                 String    @id @default(cuid())
   encounter          Encounter @relation(fields: [encounterId], references: [id])
-  encounterId        String    @unique
+  encounterId        String
   bed                Bed       @relation(fields: [bedId], references: [id])
   bedId              String
   admittedAt         DateTime  @default(now())
@@ -411,6 +389,8 @@ model Admission {
   admittingDiagnosis String?
 
   nursingNotes NursingNote[]
+
+  @@index([encounterId])
 }
 
 model NursingNote {
@@ -420,6 +400,18 @@ model NursingNote {
   note         String
   recordedById String?
   recordedAt   DateTime  @default(now())
+}
+
+model EncounterNote {
+  id          String    @id @default(cuid())
+  encounter   Encounter @relation(fields: [encounterId], references: [id])
+  encounterId String
+  department  String    // e.g. "Triage", "Consultation", "Laboratory", "Pharmacy", "Cashier", "Theatre", "Ward"
+  authorId    String?
+  note        String
+  createdAt   DateTime  @default(now())
+
+  @@index([encounterId])
 }
 
 // ---------------- Audit ----------------
@@ -436,15 +428,4 @@ model AuditLog {
 
   @@index([entityType, entityId])
   @@index([userId])
-}
-
-// ---------------- Admin-editable pricing ----------------
-
-// Flat system-wide fees an admin can change from the Pricing page instead
-// of a code change + redeploy — e.g. "consultationFee", "emergencyWardVisitFee".
-// Everything else priced (lab tests, pharmacy items, ward rates, theatre/
-// equipment fees) already has its own table with a price field.
-model Setting {
-  key   String @id
-  value String
 }

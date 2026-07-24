@@ -43,26 +43,7 @@ async function main() {
     if (!existing) await prisma.inventoryItem.create({ data: item });
   }
 
-  // 4. Lab test menu (KES pricing) — admin-editable from the Pricing page
-  // from here on; this just seeds the starting menu.
-  const labTests = [
-    { name: "Full Blood Count", price: 800 },
-    { name: "Malaria Parasite Test", price: 300 },
-    { name: "Widal Test (Typhoid)", price: 400 },
-    { name: "Urinalysis", price: 300 },
-    { name: "Blood Glucose", price: 250 },
-    { name: "HIV Rapid Test", price: 200 },
-    { name: "X-Ray Imaging", price: 1500 },
-    { name: "Ultrasound Scan", price: 2000 },
-    { name: "Hepatitis B Screen", price: 500 },
-    { name: "Pregnancy Test", price: 250 },
-  ];
-  for (const t of labTests) {
-    const existing = await prisma.labTest.findUnique({ where: { name: t.name } });
-    if (!existing) await prisma.labTest.create({ data: t });
-  }
-
-  // 5. Equipment / theatres with itemized default fees (KES)
+  // 4. Equipment / theatres with itemized default fees (KES)
   const equipment = [
     {
       name: "Theatre 1",
@@ -98,15 +79,15 @@ async function main() {
     }
   }
 
-  // 6. A couple of wards with beds, since inpatient care is in scope.
+  // 5. A couple of wards with beds, since inpatient care is in scope.
   const wards = [
-    { name: "General Ward", type: "General", bedCount: 10, dailyRate: 1500, doctorRoundFee: 800 },
-    { name: "Maternity Ward", type: "Maternity", bedCount: 6, dailyRate: 2500, doctorRoundFee: 1000 },
+    { name: "General Ward", type: "General", bedCount: 10, dailyRate: 1500 },
+    { name: "Maternity Ward", type: "Maternity", bedCount: 6, dailyRate: 2500 },
   ];
   for (const w of wards) {
     const existing = await prisma.ward.findFirst({ where: { name: w.name } });
     if (!existing) {
-      const ward = await prisma.ward.create({ data: { name: w.name, type: w.type, dailyRate: w.dailyRate, doctorRoundFee: w.doctorRoundFee } });
+      const ward = await prisma.ward.create({ data: { name: w.name, type: w.type, dailyRate: w.dailyRate } });
       for (let i = 1; i <= w.bedCount; i++) {
         await prisma.bed.create({ data: { wardId: ward.id, bedNumber: String(i).padStart(2, "0") } });
       }

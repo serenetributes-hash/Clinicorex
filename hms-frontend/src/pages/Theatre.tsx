@@ -111,9 +111,11 @@ export default function Theatre() {
       setError(err instanceof ApiError ? err.message : "Could not claim this case");
     }
   };
-  const complete = async (id: string, decision?: "WARD" | "DISCHARGE") => {
+  const [completingId, setCompletingId] = useState<string | null>(null);
+  const confirmComplete = async (id: string, decision: "WARD" | "CASHIER") => {
     try {
-      await api.post(`/theatre/bookings/${id}/complete`, decision ? { decision } : {});
+      await api.post(`/theatre/bookings/${id}/complete`, { decision });
+      setCompletingId(null);
       await loadBookings();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not complete this case");
@@ -201,43 +203,67 @@ export default function Theatre() {
             <p className="font-medium text-sm">Schedule</p>
             <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1 text-xs" />
           </div>
-          {bookings.length === 0 ? (
-            <p className="text-sm text-slate-400">No bookings for this date.</p>
-          ) : (
-            <ul className="space-y-2 max-h-[500px] overflow-auto">
-              {bookings.map((b) => (
-                <li key={b.id} className="border border-slate-200 rounded-lg px-3 py-2 text-sm">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <p className="font-medium">{b.equipment.name} · {b.time}</p>
-                      <p className="text-xs text-slate-500">{b.encounter?.patient ? `${b.encounter.patient.firstName} ${b.encounter.patient.lastName} (${b.encounter.patient.mrn})` : "Unassigned"} — {b.purpose || "No purpose noted"}</p>
-                      <p className="text-xs text-slate-400 mt-0.5">{money(b.charges.reduce((s: number, c: any) => s + Number(c.amount), 0))} · {b.charges.length} item(s)</p>
-                    </div>
-                    <Badge className="bg-slate-100 text-slate-700 border-slate-300">{b.status}</Badge>
-                  </div>
-                  {b.encounterId && b.status !== "Completed" && b.status !== "Cancelled" && (
-                    <div className="flex flex-wrap gap-3 mt-2 items-center">
-                      {b.status === "Scheduled" && <button onClick={() => claim(b.id)} className="text-xs bg-teal-800 text-white rounded-lg py-1 px-3 hover:bg-teal-900">Claim & start</button>}
-                      {b.status === "In progress" && (
-                        <>
-                          <span className="text-xs text-slate-500">Case done —</span>
-                          <button onClick={() => complete(b.id, "WARD")} className="text-xs bg-emerald-700 text-white rounded-lg py-1 px-3 hover:bg-emerald-800">Bill & send to ward</button>
-                          <button onClick={() => complete(b.id, "DISCHARGE")} className="text-xs bg-emerald-700 text-white rounded-lg py-1 px-3 hover:bg-emerald-800">Bill & discharge</button>
-                        </>
-                      )}
-                      <button onClick={() => cancel(b.id)} className="text-xs text-slate-400 hover:text-rose-600">Cancel</button>
-                    </div>
-                  )}
-                  {!b.encounterId && b.status === "Scheduled" && (
-                    <div className="flex gap-3 mt-2">
-                      <button onClick={() => complete(b.id)} className="text-xs bg-emerald-700 text-white rounded-lg py-1 px-3 hover:bg-emerald-800">Mark completed</button>
-                      <button onClick={() => cancel(b.id)} className="text-xs text-slate-400 hover:text-rose-600">Cancel</button>
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
+          {(() => {
+            const active = bookings.filter((b: any) => b.status !== "Completed" && b.status !== "Cancelled");
+            const finished = bookings.filter((b: any) => b.status === "Completed" || b.status === "Cancelled");
+            return (
+              <>
+                {active.length === 0 ? (
+                  <p className="text-sm text-slate-400">No active bookings for this date.</p>
+                ) : (
+                  <ul className="space-y-2 max-h-[420px] overflow-auto">
+                    {active.map((b: any) => (
+                      <li key={b.id} className="border border-slate-200 rounded-lg px-3 py-2 text-sm">
+                        <div className="flex justify-between items-start">
+                          <div>
+                            <p className="font-medium">{b.equipment.name} · {b.time}</p>
+                            <p className="text-xs text-slate-500">{b.encounter?.patient ? `${b.encounter.patient.firstName} ${b.encounter.patient.lastName} (${b.encounter.patient.mrn})` : "Unassigned"} — {b.purpose || "No purpose noted"}</p>
+                            <p className="text-xs text-slate-400 mt-0.5">{money(b.charges.reduce((s: number, c: any) => s + Number(c.amount), 0))} · {b.charges.length} item(s)</p>
+                          </div>
+                          <Badge className="bg-slate-100 text-slate-700 border-slate-300">{b.status}</Badge>
+                        </div>
+                        {b.encounterId && (
+                          <div className="mt-2">
+                            {b.status === "Scheduled" && <button onClick={() => claim(b.id)} className="text-xs bg-teal-800 text-white rounded-lg py-1 px-3 hover:bg-teal-900">Claim & start</button>}
+                            {b.status === "In progress" && completingId !== b.id && (
+                              <button onClick={() => setCompletingId(b.id)} className="text-xs bg-emerald-700 text-white rounded-lg py-1 px-3 hover:bg-emerald-800">Complete & bill</button>
+                            )}
+                            {b.status === "In progress" && completingId === b.id && (
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-slate-500">Send patient to:</span>
+                                <button onClick={() => confirmComplete(b.id, "WARD")} className="text-xs bg-indigo-700 text-white rounded-lg py-1 px-2.5 hover:bg-indigo-800">Ward (recovery)</button>
+                                <button onClick={() => confirmComplete(b.id, "CASHIER")} className="text-xs bg-orange-700 text-white rounded-lg py-1 px-2.5 hover:bg-orange-800">Cashier (discharge)</button>
+                                <button onClick={() => setCompletingId(null)} className="text-xs text-slate-400 hover:text-rose-600">Back</button>
+                              </div>
+                            )}
+                            {b.status !== "In progress" && <button onClick={() => cancel(b.id)} className="text-xs text-slate-400 hover:text-rose-600 ml-3">Cancel</button>}
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {finished.length > 0 && (
+                  <details className="mt-4">
+                    <summary className="text-xs text-slate-500 cursor-pointer hover:text-slate-700">Completed / cancelled ({finished.length}) — click to show</summary>
+                    <ul className="space-y-2 mt-2 max-h-[300px] overflow-auto">
+                      {finished.map((b: any) => (
+                        <li key={b.id} className="border border-slate-100 rounded-lg px-3 py-2 text-sm bg-slate-50">
+                          <div className="flex justify-between items-start">
+                            <div>
+                              <p className="font-medium text-slate-600">{b.equipment.name} · {b.time}</p>
+                              <p className="text-xs text-slate-400">{b.encounter?.patient ? `${b.encounter.patient.firstName} ${b.encounter.patient.lastName} (${b.encounter.patient.mrn})` : "Unassigned"} — {b.purpose || "No purpose noted"}</p>
+                            </div>
+                            <Badge className={b.status === "Completed" ? "bg-emerald-100 text-emerald-800 border-emerald-300" : "bg-slate-200 text-slate-500 border-slate-300"}>{b.status}</Badge>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </>
+            );
+          })()}
         </Card>
       </div>
     </div>
